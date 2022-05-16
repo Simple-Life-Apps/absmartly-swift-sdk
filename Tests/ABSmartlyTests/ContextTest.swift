@@ -7,6 +7,7 @@ import XCTest
 final class ContextTest: XCTestCase {
 	var provider: ContextDataProviderMock = ContextDataProviderMock()
 	var handler: ContextEventHandlerMock = ContextEventHandlerMock()
+	var logger: ContextEventLoggerMock = ContextEventLoggerMock()
 	var parser: VariableParser = DefaultVariableParser()
 	var scheduler: SchedulerMock = SchedulerMock()
 	var clock: ClockMock = ClockMock()
@@ -14,6 +15,7 @@ final class ContextTest: XCTestCase {
 	override func setUp() async throws {
 		provider = ContextDataProviderMock()
 		handler = ContextEventHandlerMock()
+		logger = ContextEventLoggerMock()
 		parser = DefaultVariableParser()
 		scheduler = SchedulerMock()
 		scheduler.scheduleAfterExecuteReturnValue = DefaultScheduledHandle(
@@ -40,7 +42,7 @@ final class ContextTest: XCTestCase {
 		"show-modal": "exp_test_new",
 	]
 
-	let expectedVariables: [String: Any] = [
+	let expectedVariables: [String: JSON] = [
 		"banner.border": 1,
 		"banner.size": "large",
 		"button.color": "red",
@@ -64,7 +66,8 @@ final class ContextTest: XCTestCase {
 	func createContext(config: ContextConfig, data: Promise<ContextData>? = nil) throws -> Context {
 		let data = try data ?? Promise<ContextData>.value(try getContextData())
 		return Context(
-			config: config, clock: clock, scheduler: scheduler, handler: handler, provider: provider, parser: parser,
+			config: config, clock: clock, scheduler: scheduler, handler: handler, provider: provider, logger: logger,
+			parser: parser, matcher: AudienceMatcher(),
 			promise: data)
 	}
 
@@ -89,6 +92,18 @@ final class ContextTest: XCTestCase {
 
 		overrides.forEach {
 			XCTAssertEqual($0.value, context.getOverride(experimentName: $0.key))
+		}
+	}
+
+	func testConstructorSetsCustomAssignments() throws {
+		let cassignments: [String: Int] = ["exp_test": 2, "exp_test_1": 1]
+		let contextConfig = getContextConfig(withUnits: true)
+		contextConfig.setCustomAssignments(assignments: cassignments)
+
+		let context = try createContext(config: contextConfig)
+
+		cassignments.forEach {
+			XCTAssertEqual($0.value, context.getCustomAssignment(experimentName: $0.key))
 		}
 	}
 
@@ -126,6 +141,72 @@ final class ContextTest: XCTestCase {
 		resolver.reject(ABSmartlyError("test"))
 
 		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testCallsEventLoggerWhenReady() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let (promise, resolver) = Promise<ContextData>.pending()
+		let context = try createContext(config: contextConfig, data: promise)
+
+		let expectation = XCTestExpectation()
+
+		_ = context.waitUntilReady().done { _ in
+			expectation.fulfill()
+		}
+
+		let data = try getContextData()
+		resolver.fulfill(data)
+
+		wait(for: [expectation], timeout: 1.0)
+
+		XCTAssertEqual(logger.handleEventContextEventCallsCount, 1)
+		XCTAssertTrue(logger.handleEventContextEventReceivedArguments!.context === context)
+		XCTAssertEqual(
+			logger.handleEventContextEventReceivedArguments!.event, ContextEventLoggerEvent.ready(data: data))
+	}
+
+	func testCallsEventLoggerWithFulfilledPromise() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let data = try getContextData()
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(data))
+
+		XCTAssertEqual(logger.handleEventContextEventCallsCount, 1)
+		XCTAssertTrue(logger.handleEventContextEventReceivedArguments!.context === context)
+		XCTAssertEqual(
+			logger.handleEventContextEventReceivedArguments!.event, ContextEventLoggerEvent.ready(data: data))
+	}
+
+	func testCallsEventLoggerWithErrorPromise() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let (promise, resolver) = Promise<ContextData>.pending()
+		let context = try createContext(config: contextConfig, data: promise)
+
+		let expectation = XCTestExpectation()
+
+		_ = context.waitUntilReady().done { _ in
+			expectation.fulfill()
+		}
+
+		let error = ABSmartlyError("test")
+		resolver.reject(error)
+
+		wait(for: [expectation], timeout: 1.0)
+
+		XCTAssertEqual(logger.handleEventContextEventCallsCount, 1)
+		XCTAssertTrue(logger.handleEventContextEventReceivedArguments!.context === context)
+		XCTAssertEqual(
+			logger.handleEventContextEventReceivedArguments!.event, ContextEventLoggerEvent.error(error: error))
+	}
+
+	func testCallsEventLoggerWithFulfilledErrorPromise() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let error = ABSmartlyError("test")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.init(error: error))
+
+		XCTAssertEqual(logger.handleEventContextEventCallsCount, 1)
+		XCTAssertTrue(logger.handleEventContextEventReceivedArguments!.context === context)
+		XCTAssertEqual(
+			logger.handleEventContextEventReceivedArguments!.event, ContextEventLoggerEvent.error(error: error))
 	}
 
 	func testWaitUntilReady() throws {
@@ -188,8 +269,8 @@ final class ContextTest: XCTestCase {
 
 		resolver.fulfill(try getContextData())
 
-		_ = context.waitUntilReady().done { _ in
-			XCTAssertEqual(1, self.scheduler.scheduleAfterExecuteCallsCount)
+		_ = context.waitUntilReady().done { [self] _ in
+			XCTAssertEqual(1, scheduler.scheduleAfterExecuteCallsCount)
 
 			expectation.fulfill()
 		}
@@ -281,6 +362,89 @@ final class ContextTest: XCTestCase {
 		XCTAssertEqual(2 + 2 * UInt(overrides.count), context.getPendingCount())
 	}
 
+	func testSetCustomAssignment() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let (promise, resolver) = Promise<ContextData>.pending()
+		let context = try createContext(config: contextConfig, data: promise)
+		XCTAssertFalse(context.isReady())
+
+		let expectation = XCTestExpectation()
+
+		context.setCustomAssignment(experimentName: "exp_test", variant: 2)
+		XCTAssertEqual(2, context.getCustomAssignment(experimentName: "exp_test"))
+
+		context.setCustomAssignment(experimentName: "exp_test", variant: 3)
+		XCTAssertEqual(3, context.getCustomAssignment(experimentName: "exp_test"))
+
+		context.setCustomAssignment(experimentName: "exp_test_2", variant: 1)
+		XCTAssertEqual(1, context.getCustomAssignment(experimentName: "exp_test_2"))
+
+		let cassignments = ["exp_test_new": 3, "exp_test_new_2": 5]
+		context.setCustomAssignments(cassignments)
+
+		XCTAssertEqual(3, context.getCustomAssignment(experimentName: "exp_test_new"))
+		XCTAssertEqual(5, context.getCustomAssignment(experimentName: "exp_test_new_2"))
+		XCTAssertEqual(nil, context.getCustomAssignment(experimentName: "exp_test_not_found"))
+
+		resolver.fulfill(try getContextData())
+
+		_ = context.waitUntilReady().done { _ in
+			XCTAssertEqual(3, context.getCustomAssignment(experimentName: "exp_test"))
+			XCTAssertEqual(1, context.getCustomAssignment(experimentName: "exp_test_2"))
+			XCTAssertEqual(3, context.getCustomAssignment(experimentName: "exp_test_new"))
+			XCTAssertEqual(5, context.getCustomAssignment(experimentName: "exp_test_new_2"))
+			XCTAssertEqual(nil, context.getCustomAssignment(experimentName: "exp_test_not_found"))
+
+			expectation.fulfill()
+		}
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testSetCustomAssignmentDoesNotOverrideFullOnOrNotEligibleAssignments() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let context = try createContext(config: contextConfig)
+
+		let cassignments: [String: Int] = ["exp_test_not_eligible": 3, "exp_test_fullon": 3]
+		context.setCustomAssignments(cassignments)
+
+		XCTAssertEqual(0, context.getTreatment("exp_test_not_eligible"))
+		XCTAssertEqual(2, context.getTreatment("exp_test_fullon"))
+	}
+
+	func testSetCustomAssignmentClearsAssignmentCache() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let context = try createContext(config: contextConfig)
+
+		let cassignments: [String: Int] = ["exp_test_ab": 2, "exp_test_abc": 3]
+
+		cassignments.forEach { XCTAssertEqual(expectedVariants[$0.key], context.getTreatment($0.key)) }
+		XCTAssertEqual(UInt(cassignments.count), context.getPendingCount())
+
+		context.setCustomAssignments(cassignments)
+
+		cassignments.forEach {
+			context.setCustomAssignment(experimentName: $0.key, variant: $0.value)
+			XCTAssertEqual($0.value, context.getTreatment($0.key))
+		}
+		XCTAssertEqual(2 * UInt(cassignments.count), context.getPendingCount())
+
+		// overriding with the same variant shouldn't clear assignment cache
+		cassignments.forEach {
+			context.setCustomAssignment(experimentName: $0.key, variant: $0.value)
+			XCTAssertEqual($0.value, context.getTreatment($0.key))
+		}
+		XCTAssertEqual(2 * UInt(cassignments.count), context.getPendingCount())
+
+		// overriding with the different variant should clear assignment cache
+		cassignments.forEach {
+			context.setCustomAssignment(experimentName: $0.key, variant: $0.value + 11)
+			XCTAssertEqual($0.value + 11, context.getTreatment($0.key))
+		}
+
+		XCTAssertEqual(3 * UInt(cassignments.count), context.getPendingCount())
+	}
+
 	func testPeekTreatment() throws {
 		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
 		let contextData = try getContextData()
@@ -300,7 +464,7 @@ final class ContextTest: XCTestCase {
 		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
 
 		variableExperiments.forEach { variableName, experimentName in
-			let actual = context.peekVariableValue(key: variableName, defaultValue: 17)
+			let actual = context.peekVariableValue(variableName, defaultValue: 17)
 			let eligible = experimentName != "exp_test_not_eligible"
 
 			if eligible
@@ -309,17 +473,30 @@ final class ContextTest: XCTestCase {
 				})
 			{
 				let expected = expectedVariables[variableName]
-				if let expected = expected as? Int {
-					XCTAssertEqual(expected, actual as? Int)
-				} else if let expected = expected as? String {
-					XCTAssertEqual(expected, actual as? String)
-				}
+				XCTAssertEqual(expected, actual)
+				XCTAssertEqual(expected, actual)
 			} else {
-				XCTAssertEqual(17, actual as! Int)
+				XCTAssertEqual(17, actual)
 			}
 		}
 
 		XCTAssertEqual(0, context.getPendingCount())
+	}
+
+	func testPeekVariableValueReturnsAssignedVariantOnAudienceMismatchNonStrictMode() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData(source: "audience_context")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+
+		XCTAssertEqual("large", context.peekVariableValue("banner.size", defaultValue: "small"))
+	}
+
+	func testPeekVariableValueReturnsControlVariantOnAudienceMismatchStrictMode() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData(source: "audience_strict_context")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+
+		XCTAssertEqual("small", context.peekVariableValue("banner.size", defaultValue: "small"))
 	}
 
 	func testGetVariableValue() throws {
@@ -328,7 +505,7 @@ final class ContextTest: XCTestCase {
 		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
 
 		variableExperiments.forEach { variableName, experimentName in
-			let actual = context.getVariableValue(key: variableName, defaultValue: 17)
+			let actual = context.getVariableValue(variableName, defaultValue: 17)
 			let eligible = experimentName != "exp_test_not_eligible"
 
 			if eligible
@@ -337,17 +514,166 @@ final class ContextTest: XCTestCase {
 				})
 			{
 				let expected = expectedVariables[variableName]
-				if let expected = expected as? Int {
-					XCTAssertEqual(expected, actual as? Int)
-				} else if let expected = expected as? String {
-					XCTAssertEqual(expected, actual as? String)
-				}
+				XCTAssertEqual(expected, actual)
+				XCTAssertEqual(expected, actual)
 			} else {
-				XCTAssertEqual(17, actual as! Int)
+				XCTAssertEqual(17, actual)
 			}
 		}
 
 		XCTAssertEqual(UInt(contextData.experiments.count), context.getPendingCount())
+	}
+
+	func testGetVariableValueQueuesExposureWithAudienceMismatchFalseOnAudienceMatch() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData(source: "audience_context")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+
+		context.setAttribute(name: "age", value: 21)
+
+		XCTAssertEqual("large", context.getVariableValue("banner.size", defaultValue: "small"))
+		XCTAssertEqual(1, context.getPendingCount())
+
+		let expectation = XCTestExpectation()
+
+		let (promise, resolver) = Promise<Void>.pending()
+		handler.publishEventReturnValue = promise
+
+		let expected = PublishEvent()
+		expected.hashed = true
+		expected.units = publishUnits
+		expected.publishedAt = clock.millis()
+		expected.attributes = [
+			Attribute("age", value: 21, setAt: clock.millis())
+		]
+		expected.exposures = [
+			Exposure(1, "exp_test_ab", "session_id", 1, clock.millis(), true, true, false, false, false, false)
+		]
+
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
+
+			// sort so array equality works
+			handler.publishEventReceivedEvent?.units.sort(by: {
+				$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
+			})
+			XCTAssertEqual(expected, handler.publishEventReceivedEvent)
+
+			expectation.fulfill()
+		}
+
+		resolver.fulfill(())
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testGetVariableValueQueuesExposureWithAudienceMismatchTrueOnAudienceMismatch() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData(source: "audience_context")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+
+		XCTAssertEqual("large", context.getVariableValue("banner.size", defaultValue: "small"))
+		XCTAssertEqual(1, context.getPendingCount())
+
+		let expectation = XCTestExpectation()
+
+		let (promise, resolver) = Promise<Void>.pending()
+		handler.publishEventReturnValue = promise
+
+		let expected = PublishEvent()
+		expected.hashed = true
+		expected.units = publishUnits
+		expected.publishedAt = clock.millis()
+		expected.exposures = [
+			Exposure(1, "exp_test_ab", "session_id", 1, clock.millis(), true, true, false, false, false, true)
+		]
+
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
+
+			// sort so array equality works
+			handler.publishEventReceivedEvent?.units.sort(by: {
+				$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
+			})
+			XCTAssertEqual(expected, handler.publishEventReceivedEvent)
+
+			expectation.fulfill()
+		}
+
+		resolver.fulfill(())
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testGetVariableValueQueuesExposureWithAudienceMismatchFalseAndControlVariantOnAudienceMismatchInStrictMode()
+		throws
+	{
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData(source: "audience_strict_context")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+
+		XCTAssertEqual("small", context.getVariableValue("banner.size", defaultValue: "small"))
+		XCTAssertEqual(1, context.getPendingCount())
+
+		let expectation = XCTestExpectation()
+
+		let (promise, resolver) = Promise<Void>.pending()
+		handler.publishEventReturnValue = promise
+
+		let expected = PublishEvent()
+		expected.hashed = true
+		expected.units = publishUnits
+		expected.publishedAt = clock.millis()
+		expected.exposures = [
+			Exposure(1, "exp_test_ab", "session_id", 0, clock.millis(), false, true, false, false, false, true)
+		]
+
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
+
+			// sort so array equality works
+			handler.publishEventReceivedEvent?.units.sort(by: {
+				$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
+			})
+			XCTAssertEqual(expected, handler.publishEventReceivedEvent)
+
+			expectation.fulfill()
+		}
+
+		resolver.fulfill(())
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testGetVariableValueCallsEventLogger() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let context = try createContext(config: contextConfig)
+
+		logger.clearInvocations()
+
+		_ = context.getVariableValue("banner.border")
+		_ = context.getVariableValue("banner.size")
+
+		let exposures = [
+			Exposure(1, "exp_test_ab", "session_id", 1, clock.millis(), true, true, false, false, false, false)
+		]
+
+		XCTAssertEqual(1, logger.handleEventContextEventCallsCount)
+
+		for (i, exposure) in exposures.enumerated() {
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedInvocations[i].context)
+			XCTAssertEqual(
+				ContextEventLoggerEvent.exposure(exposure: exposure),
+				logger.handleEventContextEventReceivedInvocations[i].event)
+		}
+
+		// verify not called again with the same exposure
+		logger.clearInvocations()
+
+		_ = context.getVariableValue("banner.border")
+		_ = context.getVariableValue("banner.size")
+
+		XCTAssertEqual(0, logger.handleEventContextEventCallsCount)
 	}
 
 	func testGetVariableKeys() throws {
@@ -383,6 +709,22 @@ final class ContextTest: XCTestCase {
 		XCTAssertEqual(0, context.getPendingCount())
 	}
 
+	func testPeekTreatmentReturnsAssignedVariantOnAudienceMismatchNonStrictMode() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData(source: "audience_context")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+
+		XCTAssertEqual(1, context.peekTreatment("exp_test_ab"))
+	}
+
+	func testPeekTreatmentReturnsControlVariantOnAudienceMismatchStrictMode() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData(source: "audience_strict_context")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+
+		XCTAssertEqual(0, context.peekTreatment("exp_test_ab"))
+	}
+
 	func testGetTreatment() throws {
 		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
 		let contextData = try getContextData()
@@ -407,21 +749,21 @@ final class ContextTest: XCTestCase {
 		expected.units = publishUnits
 		expected.publishedAt = clock.millis()
 		expected.exposures = [
-			Exposure(1, "exp_test_ab", "session_id", 1, clock.millis(), true, true, false, false),
-			Exposure(2, "exp_test_abc", "session_id", 2, clock.millis(), true, true, false, false),
-			Exposure(3, "exp_test_not_eligible", "user_id", 0, clock.millis(), true, false, false, false),
-			Exposure(4, "exp_test_fullon", "session_id", 2, clock.millis(), true, true, false, true),
-			Exposure(0, "not_found", nil, 0, clock.millis(), false, true, false, false),
+			Exposure(1, "exp_test_ab", "session_id", 1, clock.millis(), true, true, false, false, false, false),
+			Exposure(2, "exp_test_abc", "session_id", 2, clock.millis(), true, true, false, false, false, false),
+			Exposure(3, "exp_test_not_eligible", "user_id", 0, clock.millis(), true, false, false, false, false, false),
+			Exposure(4, "exp_test_fullon", "session_id", 2, clock.millis(), true, true, false, true, false, false),
+			Exposure(0, "not_found", nil, 0, clock.millis(), false, true, false, false, false, false),
 		]
 
-		_ = context.publish().done {
-			XCTAssertEqual(1, self.handler.publishEventCallsCount)
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
 
 			// sort so array equality works
-			self.handler.publishEventReceivedEvent?.units.sort(by: {
+			handler.publishEventReceivedEvent?.units.sort(by: {
 				$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
 			})
-			XCTAssertEqual(expected, self.handler.publishEventReceivedEvent)
+			XCTAssertEqual(expected, handler.publishEventReceivedEvent)
 
 			expectation.fulfill()
 		}
@@ -477,21 +819,21 @@ final class ContextTest: XCTestCase {
 		expected.units = publishUnits
 		expected.publishedAt = clock.millis()
 		expected.exposures = [
-			Exposure(1, "exp_test_ab", "session_id", 12, clock.millis(), true, true, true, false),
-			Exposure(2, "exp_test_abc", "session_id", 13, clock.millis(), true, true, true, false),
-			Exposure(3, "exp_test_not_eligible", "user_id", 11, clock.millis(), true, true, true, false),
-			Exposure(4, "exp_test_fullon", "session_id", 13, clock.millis(), true, true, true, false),
-			Exposure(0, "not_found", nil, 3, clock.millis(), false, true, true, false),
+			Exposure(1, "exp_test_ab", "session_id", 12, clock.millis(), true, true, true, false, false, false),
+			Exposure(2, "exp_test_abc", "session_id", 13, clock.millis(), true, true, true, false, false, false),
+			Exposure(3, "exp_test_not_eligible", "user_id", 11, clock.millis(), true, true, true, false, false, false),
+			Exposure(4, "exp_test_fullon", "session_id", 13, clock.millis(), true, true, true, false, false, false),
+			Exposure(0, "not_found", nil, 3, clock.millis(), false, true, true, false, false, false),
 		]
 
-		_ = context.publish().done {
-			XCTAssertEqual(1, self.handler.publishEventCallsCount)
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
 
 			// sort so array equality works
-			self.handler.publishEventReceivedEvent?.units.sort(by: {
+			handler.publishEventReceivedEvent?.units.sort(by: {
 				$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
 			})
-			XCTAssertEqual(expected, self.handler.publishEventReceivedEvent)
+			XCTAssertEqual(expected, handler.publishEventReceivedEvent)
 
 			expectation.fulfill()
 		}
@@ -527,8 +869,8 @@ final class ContextTest: XCTestCase {
 		let (promise, resolver) = Promise<Void>.pending()
 		handler.publishEventReturnValue = promise
 
-		_ = context.publish().done {
-			XCTAssertEqual(1, self.handler.publishEventCallsCount)
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
 			XCTAssertEqual(0, context.getPendingCount())
 
 			_ = context.getTreatment("not_found")
@@ -541,6 +883,161 @@ final class ContextTest: XCTestCase {
 		resolver.fulfill(())
 
 		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testGetTreatmentQueuesExposureWithAudienceMismatchFalseOnAudienceMatch() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData(source: "audience_context")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+		context.setAttribute(name: "age", value: 21)
+
+		XCTAssertEqual(1, context.getTreatment("exp_test_ab"))
+		XCTAssertEqual(1, context.getPendingCount())
+
+		let expectation = XCTestExpectation()
+
+		let (promise, resolver) = Promise<Void>.pending()
+		handler.publishEventReturnValue = promise
+
+		let expected = PublishEvent()
+		expected.hashed = true
+		expected.units = publishUnits
+		expected.publishedAt = clock.millis()
+		expected.attributes = [
+			Attribute("age", value: 21, setAt: clock.millis())
+		]
+
+		expected.exposures = [
+			Exposure(1, "exp_test_ab", "session_id", 1, clock.millis(), true, true, false, false, false, false)
+		]
+
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
+
+			// sort so array equality works
+			handler.publishEventReceivedEvent?.units.sort(by: {
+				$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
+			})
+			XCTAssertEqual(expected, handler.publishEventReceivedEvent)
+
+			expectation.fulfill()
+		}
+
+		resolver.fulfill(())
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testGetTreatmentQueuesExposureWithAudienceMismatchTrueOnAudienceMismatch() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData(source: "audience_context")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+
+		XCTAssertEqual(1, context.getTreatment("exp_test_ab"))
+		XCTAssertEqual(1, context.getPendingCount())
+
+		let expectation = XCTestExpectation()
+
+		let (promise, resolver) = Promise<Void>.pending()
+		handler.publishEventReturnValue = promise
+
+		let expected = PublishEvent()
+		expected.hashed = true
+		expected.units = publishUnits
+		expected.publishedAt = clock.millis()
+
+		expected.exposures = [
+			Exposure(1, "exp_test_ab", "session_id", 1, clock.millis(), true, true, false, false, false, true)
+		]
+
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
+
+			// sort so array equality works
+			handler.publishEventReceivedEvent?.units.sort(by: {
+				$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
+			})
+			XCTAssertEqual(expected, handler.publishEventReceivedEvent)
+
+			expectation.fulfill()
+		}
+
+		resolver.fulfill(())
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testGetTreatmentQueuesExposureWithAudienceMismatchTrueAndControlVariantOnAudienceMismatchInStrictMode() throws
+	{
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData(source: "audience_strict_context")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+
+		XCTAssertEqual(0, context.getTreatment("exp_test_ab"))
+		XCTAssertEqual(1, context.getPendingCount())
+
+		let expectation = XCTestExpectation()
+
+		let (promise, resolver) = Promise<Void>.pending()
+		handler.publishEventReturnValue = promise
+
+		let expected = PublishEvent()
+		expected.hashed = true
+		expected.units = publishUnits
+		expected.publishedAt = clock.millis()
+
+		expected.exposures = [
+			Exposure(1, "exp_test_ab", "session_id", 0, clock.millis(), false, true, false, false, false, true)
+		]
+
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
+
+			// sort so array equality works
+			handler.publishEventReceivedEvent?.units.sort(by: {
+				$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
+			})
+			XCTAssertEqual(expected, handler.publishEventReceivedEvent)
+
+			expectation.fulfill()
+		}
+
+		resolver.fulfill(())
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testGetTreatmentCallsEventLogger() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData()
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+
+		logger.clearInvocations()
+
+		_ = context.getTreatment("exp_test_ab")
+		_ = context.getTreatment("not_found")
+
+		let exposures = [
+			Exposure(1, "exp_test_ab", "session_id", 1, clock.millis(), true, true, false, false, false, false),
+			Exposure(0, "not_found", nil, 0, clock.millis(), false, true, false, false, false, false),
+		]
+
+		XCTAssertEqual(2, logger.handleEventContextEventCallsCount)
+
+		for (i, exposure) in exposures.enumerated() {
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedInvocations[i].context)
+			XCTAssertEqual(
+				ContextEventLoggerEvent.exposure(exposure: exposure),
+				logger.handleEventContextEventReceivedInvocations[i].event)
+		}
+
+		// verify not called again with the same exposure
+		logger.clearInvocations()
+
+		_ = context.getTreatment("exp_test_ab")
+		_ = context.getTreatment("not_found")
+
+		XCTAssertEqual(0, logger.handleEventContextEventCallsCount)
 	}
 
 	func testTrack() throws {
@@ -573,14 +1070,14 @@ final class ContextTest: XCTestCase {
 			GoalAchievement("goal3", achievedAt: clock.millis(), properties: nil),
 		]
 
-		_ = context.publish().done {
-			XCTAssertEqual(1, self.handler.publishEventCallsCount)
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
 
 			// sort so array equality works
-			self.handler.publishEventReceivedEvent?.units.sort(by: {
+			handler.publishEventReceivedEvent?.units.sort(by: {
 				$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
 			})
-			XCTAssertEqual(expected, self.handler.publishEventReceivedEvent)
+			XCTAssertEqual(expected, handler.publishEventReceivedEvent)
 
 			expectation.fulfill()
 		}
@@ -588,6 +1085,44 @@ final class ContextTest: XCTestCase {
 		resolver.fulfill(())
 
 		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testTrackCallsEventLogger() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let context = try createContext(config: contextConfig)
+
+		logger.clearInvocations()
+
+		context.track("goal1", properties: ["amount": 125, "hours": 245])
+		context.track("goal2", properties: ["tries": 7])
+
+		XCTAssertEqual(2, logger.handleEventContextEventCallsCount)
+
+		let goals = [
+			GoalAchievement("goal1", achievedAt: clock.millis(), properties: ["amount": 125, "hours": 245]),
+			GoalAchievement("goal2", achievedAt: clock.millis(), properties: ["tries": 7]),
+		]
+
+		XCTAssertEqual(2, logger.handleEventContextEventCallsCount)
+
+		for (i, goal) in goals.enumerated() {
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedInvocations[i].context)
+			XCTAssertEqual(
+				ContextEventLoggerEvent.goal(goal: goal), logger.handleEventContextEventReceivedInvocations[i].event)
+		}
+
+		logger.clearInvocations()
+
+		context.track("goal1", properties: ["amount": 125, "hours": 245])
+		context.track("goal2", properties: ["tries": 7])
+
+		XCTAssertEqual(2, logger.handleEventContextEventCallsCount)
+
+		for (i, goal) in goals.enumerated() {
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedInvocations[i].context)
+			XCTAssertEqual(
+				ContextEventLoggerEvent.goal(goal: goal), logger.handleEventContextEventReceivedInvocations[i].event)
+		}
 	}
 
 	func testTrackStartsPublishTimeoutAfterAchievement() throws {
@@ -632,24 +1167,97 @@ final class ContextTest: XCTestCase {
 
 		let expectation = XCTestExpectation()
 
-		_ = context.publish().done {
-			XCTAssertEqual(0, self.handler.publishEventCallsCount)
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(0, handler.publishEventCallsCount)
 			expectation.fulfill()
 		}
 
 		wait(for: [expectation], timeout: 1.0)
 	}
 
-	func testPublishResetsInternalQueuesAndKeepsAttributesOverrides() throws {
+	func testPublishCallsEventLogger() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let context = try createContext(config: contextConfig)
+
+		context.track("goal1", properties: ["amount": 125, "hours": 245])
+
+		logger.clearInvocations()
+
+		let expectation = XCTestExpectation()
+
+		let (promise, resolver) = Promise<Void>.pending()
+		handler.publishEventReturnValue = promise
+
+		let expected = PublishEvent()
+		expected.hashed = true
+		expected.units = publishUnits
+		expected.publishedAt = clock.millis()
+		expected.goals = [
+			GoalAchievement("goal1", achievedAt: clock.millis(), properties: ["amount": 125, "hours": 245])
+		]
+
+		_ = context.publish().done { [self] in
+			// sort so array equality works
+			// event is the same passed to logger
+			handler.publishEventReceivedEvent?.units.sort(by: {
+				$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
+			})
+			handler.publishEventReceivedEvent?.attributes.sort(by: {
+				$0.name != $1.name ? $0.name < $1.name : $0.setAt < $1.setAt
+			})
+			XCTAssertEqual(1, logger.handleEventContextEventCallsCount)
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedArguments!.context)
+			XCTAssertEqual(
+				ContextEventLoggerEvent.publish(event: expected), logger.handleEventContextEventReceivedArguments!.event
+			)
+
+			expectation.fulfill()
+		}
+
+		resolver.fulfill(())
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testPublishCallsEventLoggerOnError() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let context = try createContext(config: contextConfig)
+
+		context.track("goal1", properties: ["amount": 125, "hours": 245])
+
+		logger.clearInvocations()
+
+		let expectation = XCTestExpectation()
+
+		let error = ABSmartlyError("test")
+		let (promise, resolver) = Promise<Void>.pending()
+		handler.publishEventReturnValue = promise
+
+		_ = context.publish().catch { [self] error in
+			XCTAssertEqual(1, logger.handleEventContextEventCallsCount)
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedArguments!.context)
+			XCTAssertEqual(
+				ContextEventLoggerEvent.error(error: error), logger.handleEventContextEventReceivedArguments!.event)
+
+			expectation.fulfill()
+		}
+
+		resolver.reject(error)
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testPublishResetsInternalQueuesAndKeepsAttributesOverridesAndCustomAssignments() throws {
 		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
 		contextConfig.setAttributes(attributes: ["attr1": "value1", "attr2": 2])
 		contextConfig.setOverride(experimentName: "not_found", variant: 3)
+		contextConfig.setCustomAssignment(experimentName: "exp_test_abc", variant: 3)
 		let context = try createContext(config: contextConfig)
 
 		XCTAssertEqual(0, context.getPendingCount())
 
 		XCTAssertEqual(1, context.getTreatment("exp_test_ab"))
-		XCTAssertEqual(2, context.getTreatment("exp_test_abc"))
+		XCTAssertEqual(3, context.getTreatment("exp_test_abc"))
 		XCTAssertEqual(3, context.getTreatment("not_found"))
 		context.track("goal1", properties: ["amount": 125, "hours": 245])
 
@@ -666,9 +1274,9 @@ final class ContextTest: XCTestCase {
 			expected.units = publishUnits
 			expected.publishedAt = clock.millis()
 			expected.exposures = [
-				Exposure(1, "exp_test_ab", "session_id", 1, clock.millis(), true, true, false, false),
-				Exposure(2, "exp_test_abc", "session_id", 2, clock.millis(), true, true, false, false),
-				Exposure(0, "not_found", nil, 3, clock.millis(), false, true, true, false),
+				Exposure(1, "exp_test_ab", "session_id", 1, clock.millis(), true, true, false, false, false, false),
+				Exposure(2, "exp_test_abc", "session_id", 3, clock.millis(), true, true, false, false, true, false),
+				Exposure(0, "not_found", nil, 3, clock.millis(), false, true, true, false, false, false),
 			]
 			expected.goals = [
 				GoalAchievement("goal1", achievedAt: clock.millis(), properties: ["amount": 125, "hours": 245])
@@ -678,17 +1286,17 @@ final class ContextTest: XCTestCase {
 				Attribute("attr2", value: 2, setAt: clock.millis()),
 			]
 
-			_ = context.publish().done {
-				XCTAssertEqual(1, self.handler.publishEventCallsCount)
+			_ = context.publish().done { [self] in
+				XCTAssertEqual(1, handler.publishEventCallsCount)
 
 				// sort so array equality works
-				self.handler.publishEventReceivedEvent?.units.sort(by: {
+				handler.publishEventReceivedEvent?.units.sort(by: {
 					$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
 				})
-				self.handler.publishEventReceivedEvent?.attributes.sort(by: {
+				handler.publishEventReceivedEvent?.attributes.sort(by: {
 					$0.name != $1.name ? $0.name < $1.name : $0.setAt < $1.setAt
 				})
-				XCTAssertEqual(expected, self.handler.publishEventReceivedEvent)
+				XCTAssertEqual(expected, handler.publishEventReceivedEvent)
 
 				expectation.fulfill()
 			}
@@ -701,7 +1309,7 @@ final class ContextTest: XCTestCase {
 		XCTAssertEqual(0, context.getPendingCount())
 
 		XCTAssertEqual(1, context.getTreatment("exp_test_ab"))
-		XCTAssertEqual(2, context.getTreatment("exp_test_abc"))
+		XCTAssertEqual(3, context.getTreatment("exp_test_abc"))
 		XCTAssertEqual(3, context.getTreatment("not_found"))
 
 		context.track("goal1", properties: ["amount": 125, "hours": 245])
@@ -725,17 +1333,17 @@ final class ContextTest: XCTestCase {
 				Attribute("attr2", value: 2, setAt: clock.millis()),
 			]
 
-			_ = context.publish().done {
-				XCTAssertEqual(2, self.handler.publishEventCallsCount)
+			_ = context.publish().done { [self] in
+				XCTAssertEqual(2, handler.publishEventCallsCount)
 
 				// sort so array equality works
-				self.handler.publishEventReceivedEvent?.units.sort(by: {
+				handler.publishEventReceivedEvent?.units.sort(by: {
 					$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
 				})
-				self.handler.publishEventReceivedEvent?.attributes.sort(by: {
+				handler.publishEventReceivedEvent?.attributes.sort(by: {
 					$0.name != $1.name ? $0.name < $1.name : $0.setAt < $1.setAt
 				})
-				XCTAssertEqual(expected, self.handler.publishEventReceivedEvent)
+				XCTAssertEqual(expected, handler.publishEventReceivedEvent)
 
 				expectation.fulfill()
 			}
@@ -761,8 +1369,8 @@ final class ContextTest: XCTestCase {
 
 		let expectation = XCTestExpectation()
 
-		_ = context.publish().done {
-			XCTAssertEqual(0, self.handler.publishEventCallsCount)
+		_ = context.publish().done { [self] in
+			XCTAssertEqual(0, handler.publishEventCallsCount)
 			expectation.fulfill()
 		}
 
@@ -782,8 +1390,8 @@ final class ContextTest: XCTestCase {
 		let (promise, resolver) = Promise<Void>.pending()
 		handler.publishEventReturnValue = promise
 
-		_ = context.publish().catch { error in
-			XCTAssertEqual(1, self.handler.publishEventCallsCount)
+		_ = context.publish().catch { [self] error in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
 			XCTAssertTrue(error is ABSmartlyError)
 
 			expectation.fulfill()
@@ -807,8 +1415,8 @@ final class ContextTest: XCTestCase {
 		let (promise, resolver) = Promise<Void>.pending()
 		handler.publishEventReturnValue = promise
 
-		_ = context.close().done {
-			XCTAssertEqual(1, self.handler.publishEventCallsCount)
+		_ = context.close().done { [self] in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
 
 			expectation.fulfill()
 		}
@@ -817,6 +1425,74 @@ final class ContextTest: XCTestCase {
 		XCTAssertFalse(context.isClosed())
 
 		resolver.fulfill(())
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testCloseCallsEventLogger() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let context = try createContext(config: contextConfig)
+
+		logger.clearInvocations()
+
+		let expectation = XCTestExpectation()
+
+		_ = context.close().done { [self] in
+			XCTAssertEqual(1, logger.handleEventContextEventCallsCount)
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedArguments!.context)
+			XCTAssertEqual(ContextEventLoggerEvent.close, logger.handleEventContextEventReceivedArguments!.event)
+
+			expectation.fulfill()
+		}
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testCloseCallsEventLoggerWithPendingEvents() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let context = try createContext(config: contextConfig)
+
+		context.track("goal1", properties: ["amount": 125, "hours": 245])
+
+		logger.clearInvocations()
+
+		let expectation = XCTestExpectation()
+
+		handler.publishEventReturnValue = Promise<Void>.value(())
+
+		_ = context.close().done { [self] in
+			XCTAssertEqual(2, logger.handleEventContextEventCallsCount)
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedInvocations[0].context)
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedInvocations[1].context)
+			XCTAssertEqual(ContextEventLoggerEvent.close, logger.handleEventContextEventReceivedInvocations[1].event)
+
+			expectation.fulfill()
+		}
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testCloseCallsEventLoggerOnError() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let context = try createContext(config: contextConfig)
+
+		context.track("goal1", properties: ["amount": 125, "hours": 245])
+
+		logger.clearInvocations()
+
+		let expectation = XCTestExpectation()
+
+		let error = ABSmartlyError("test")
+		handler.publishEventReturnValue = Promise<Void>.init(error: error)
+
+		_ = context.close().catch { [self] error in
+			XCTAssertEqual(1, logger.handleEventContextEventCallsCount)
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedInvocations[0].context)
+			XCTAssertEqual(
+				ContextEventLoggerEvent.error(error: error), logger.handleEventContextEventReceivedInvocations[0].event)
+
+			expectation.fulfill()
+		}
 
 		wait(for: [expectation], timeout: 1.0)
 	}
@@ -834,8 +1510,8 @@ final class ContextTest: XCTestCase {
 		let (promise, resolver) = Promise<Void>.pending()
 		handler.publishEventReturnValue = promise
 
-		_ = context.close().catch { error in
-			XCTAssertEqual(1, self.handler.publishEventCallsCount)
+		_ = context.close().catch { [self] error in
+			XCTAssertEqual(1, handler.publishEventCallsCount)
 			XCTAssertTrue(error is ABSmartlyError)
 
 			expectation.fulfill()
@@ -861,14 +1537,61 @@ final class ContextTest: XCTestCase {
 
 		let expectation = XCTestExpectation()
 
-		_ = context.refresh().done {
-			XCTAssertEqual(1, self.provider.getContextDataCallsCount)
+		_ = context.refresh().done { [self] in
+			XCTAssertEqual(1, provider.getContextDataCallsCount)
 			XCTAssertEqual(refreshedContextData.experiments.map { $0.name }, context.getExperiments())
 
 			expectation.fulfill()
 		}
 
 		resolver.fulfill(refreshedContextData)
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testRefreshCallsEventLogger() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let context = try createContext(config: contextConfig)
+
+		logger.clearInvocations()
+
+		let refreshedContextData = try getContextData(source: "refreshed")
+		provider.getContextDataReturnValue = Promise<ContextData>.value(refreshedContextData)
+
+		let expectation = XCTestExpectation()
+
+		_ = context.refresh().done { [self] in
+			XCTAssertEqual(1, logger.handleEventContextEventCallsCount)
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedArguments!.context)
+			XCTAssertEqual(
+				ContextEventLoggerEvent.refresh(data: refreshedContextData),
+				logger.handleEventContextEventReceivedArguments!.event)
+
+			expectation.fulfill()
+		}
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testRefreshCallsEventLoggerOnError() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let context = try createContext(config: contextConfig)
+
+		logger.clearInvocations()
+
+		let error = ABSmartlyError("test")
+		provider.getContextDataReturnValue = Promise<ContextData>.init(error: error)
+
+		let expectation = XCTestExpectation()
+
+		_ = context.refresh().catch { [self] error in
+			XCTAssertEqual(1, logger.handleEventContextEventCallsCount)
+			XCTAssertTrue(context === logger.handleEventContextEventReceivedArguments!.context)
+			XCTAssertEqual(
+				ContextEventLoggerEvent.error(error: error), logger.handleEventContextEventReceivedArguments!.event)
+
+			expectation.fulfill()
+		}
 
 		wait(for: [expectation], timeout: 1.0)
 	}
@@ -888,8 +1611,8 @@ final class ContextTest: XCTestCase {
 
 		let expectation = XCTestExpectation()
 
-		_ = context.refresh().catch { error in
-			XCTAssertEqual(1, self.provider.getContextDataCallsCount)
+		_ = context.refresh().catch { [self] error in
+			XCTAssertEqual(1, provider.getContextDataCallsCount)
 			XCTAssertTrue(error is ABSmartlyError)
 
 			expectation.fulfill()
@@ -917,8 +1640,8 @@ final class ContextTest: XCTestCase {
 
 		let expectation = XCTestExpectation()
 
-		_ = context.refresh().done {
-			XCTAssertEqual(1, self.provider.getContextDataCallsCount)
+		_ = context.refresh().done { [self] in
+			XCTAssertEqual(1, provider.getContextDataCallsCount)
 			XCTAssertEqual(refreshedContextData.experiments.map { $0.name }, context.getExperiments())
 
 			expectation.fulfill()
@@ -953,8 +1676,8 @@ final class ContextTest: XCTestCase {
 
 		let expectation = XCTestExpectation()
 
-		_ = context.refresh().done {
-			XCTAssertEqual(1, self.provider.getContextDataCallsCount)
+		_ = context.refresh().done { [self] in
+			XCTAssertEqual(1, provider.getContextDataCallsCount)
 			XCTAssertEqual(refreshedContextData.experiments.map { $0.name }, context.getExperiments())
 
 			expectation.fulfill()
@@ -988,8 +1711,8 @@ final class ContextTest: XCTestCase {
 
 		let expectation = XCTestExpectation()
 
-		_ = context.refresh().done {
-			XCTAssertEqual(1, self.provider.getContextDataCallsCount)
+		_ = context.refresh().done { [self] in
+			XCTAssertEqual(1, provider.getContextDataCallsCount)
 			XCTAssertEqual(refreshedContextData.experiments.map { $0.name }, context.getExperiments())
 
 			expectation.fulfill()
@@ -1023,8 +1746,8 @@ final class ContextTest: XCTestCase {
 
 		let expectation = XCTestExpectation()
 
-		_ = context.refresh().done {
-			XCTAssertEqual(1, self.provider.getContextDataCallsCount)
+		_ = context.refresh().done { [self] in
+			XCTAssertEqual(1, provider.getContextDataCallsCount)
 			XCTAssertEqual(refreshedContextData.experiments.map { $0.name }, context.getExperiments())
 
 			expectation.fulfill()
@@ -1058,8 +1781,8 @@ final class ContextTest: XCTestCase {
 
 		let expectation = XCTestExpectation()
 
-		_ = context.refresh().done {
-			XCTAssertEqual(1, self.provider.getContextDataCallsCount)
+		_ = context.refresh().done { [self] in
+			XCTAssertEqual(1, provider.getContextDataCallsCount)
 			XCTAssertEqual(refreshedContextData.experiments.map { $0.name }, context.getExperiments())
 
 			expectation.fulfill()
@@ -1093,8 +1816,8 @@ final class ContextTest: XCTestCase {
 
 		let expectation = XCTestExpectation()
 
-		_ = context.refresh().done {
-			XCTAssertEqual(1, self.provider.getContextDataCallsCount)
+		_ = context.refresh().done { [self] in
+			XCTAssertEqual(1, provider.getContextDataCallsCount)
 			XCTAssertEqual(refreshedContextData.experiments.map { $0.name }, context.getExperiments())
 
 			expectation.fulfill()

@@ -1,6 +1,6 @@
 Pod::Spec.new do |spec|
   spec.name = 'ABSmartlySwiftSDK'
-  spec.version = '1.0.2'
+  spec.version = '1.2.0'
   spec.summary = 'A/B Smartly Swift SDK'
   spec.description = 'A/B Smartly SDK for iOS/tvOS/watchOS'
 
@@ -21,4 +21,5 @@ Pod::Spec.new do |spec|
   spec.framework = 'Foundation'
   spec.dependency 'PromiseKit', '>= 6.8'
   spec.dependency 'SwiftAtomics', '~> 1.0.2'
+  spec.dependency 'SwiftyJSON', '~> 4.3.0'
 end

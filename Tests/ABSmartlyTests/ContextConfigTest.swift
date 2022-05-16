@@ -24,17 +24,17 @@ final class ContextConfigTest: XCTestCase {
 		config.setAttribute(name: "user_agent", value: "Chrome")
 		config.setAttribute(name: "age", value: 9)
 
-		XCTAssertEqual(config.attributes["user_agent"] as? String, "Chrome")
-		XCTAssertEqual(config.attributes["age"] as? Int, 9)
+		XCTAssertEqual(config.attributes["user_agent"]?.stringValue, "Chrome")
+		XCTAssertEqual(config.attributes["age"]?.intValue, 9)
 	}
 
 	func testSetAttributes() {
-		let attributes: [String: Any] = ["user_agent": "Chrome", "age": 9]
+		let attributes: [String: JSON] = ["user_agent": "Chrome", "age": 9]
 		let config = ContextConfig()
 
 		config.setAttributes(attributes: attributes)
-		XCTAssertEqual(config.attributes["user_agent"] as? String, "Chrome")
-		XCTAssertEqual(config.attributes["age"] as? Int, 9)
+		XCTAssertEqual(config.attributes["user_agent"]?.stringValue, "Chrome")
+		XCTAssertEqual(config.attributes["age"]?.intValue, 9)
 	}
 
 	func testSetOverride() {
@@ -50,6 +50,21 @@ final class ContextConfigTest: XCTestCase {
 
 		config.setOverrides(overrides: overrides)
 		XCTAssertEqual(config.overrides, overrides)
+	}
+
+	func testSetCustomAssignment() {
+		let config = ContextConfig()
+		config.setCustomAssignment(experimentName: "exp_test", variant: 2)
+
+		XCTAssertEqual(config.cassignments["exp_test"], 2)
+	}
+
+	func testSetCustomAssignments() {
+		let config = ContextConfig()
+		let cassignments = ["exp_test": 2, "exp_test_new": 1]
+
+		config.setCustomAssignments(assignments: cassignments)
+		XCTAssertEqual(config.cassignments, cassignments)
 	}
 
 	func testSetPublishDelay() {
