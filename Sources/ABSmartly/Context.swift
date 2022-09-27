@@ -12,7 +12,6 @@ public final class Context {
 	private let parser: VariableParser
 	private let matcher: AudienceMatcher
 	private var promise: Promise<ContextData>?
-	private var config: ContextConfig
 
 	private var pendingCount = ManagedAtomic<UInt>(0)
 
@@ -26,18 +25,19 @@ public final class Context {
 
 	private let timeoutLock = NSLock()
 	private var timeout: ScheduledHandle?
+	private var refreshTimer: ScheduledHandle?
 
 	private let dataLock = NSLock()
 	private var index: [String: ExperimentVariables] = [:]
 	private var indexVariables: [String: ExperimentVariables] = [:]
 	private var data: ContextData? = nil
 
-	private let assignmentLock = NSRecursiveLock()
 	private var hashedUnits: [String: [UInt8]] = [:]
 	private var assigners: [String: VariantAssigner] = [:]
 	private var assignmentCache: [String: Assignment] = [:]
 
-	private let contextLock = NSLock()
+	private let contextLock = NSRecursiveLock()
+	private var units: [String: String] = [:]
 	private var attributes: [Attribute] = []
 	private var overrides: [String: Int] = [:]
 	private var cassignments: [String: Int] = [:]
@@ -45,6 +45,9 @@ public final class Context {
 	private let eventLock = NSLock()
 	private var exposures: [Exposure] = []
 	private var achievements: [GoalAchievement] = []
+
+	private var publishDelay: TimeInterval = 0
+	private var refreshInterval: TimeInterval = 0
 
 	init(
 		config: ContextConfig, clock: Clock, scheduler: Scheduler, handler: ContextEventHandler,
@@ -60,7 +63,9 @@ public final class Context {
 		self.parser = parser
 		self.matcher = matcher
 		self.promise = promise
-		self.config = config
+
+		publishDelay = config.publishDelay
+		refreshInterval = config.refreshInterval
 
 		assigners.reserveCapacity(config.units.count)
 		hashedUnits.reserveCapacity(config.units.count)
@@ -73,6 +78,9 @@ public final class Context {
 
 		attributes.reserveCapacity(config.attributes.count)
 		setAttributes(config.attributes)
+
+		units.reserveCapacity(config.units.count)
+		setUnits(config.units)
 
 		if promise.isResolved {
 			if let data = promise.value {
@@ -151,10 +159,16 @@ public final class Context {
 		return data
 	}
 
-	private func putLocked<K, V>(lock: NSLock, dict: inout [K: V], key: K, value: V) -> V? {
+	private func putLocked<K, V>(lock: NSRecursiveLock, dict: inout [K: V], key: K, value: V) -> V? {
 		lock.lock()
 		defer { lock.unlock() }
 		return dict.updateValue(value, forKey: key)
+	}
+
+	private func getLocked<K, V>(lock: NSRecursiveLock, dict: [K: V], key: K) -> V? {
+		lock.lock()
+		defer { lock.unlock() }
+		return dict[key]
 	}
 
 	private func getLocked<K, V>(lock: NSLock, dict: [K: V], key: K) -> V? {
@@ -166,19 +180,7 @@ public final class Context {
 	public func setOverride(experimentName: String, variant: Int) {
 		checkNotClosed()
 
-		let previous: Int? = putLocked(lock: contextLock, dict: &overrides, key: experimentName, value: variant)
-		if previous == nil || previous != variant {
-			assignmentLock.lock()
-			defer { assignmentLock.unlock() }
-
-			if let assignment: Assignment = assignmentCache[experimentName] {
-				if !assignment.overridden || assignment.variant != variant {
-					if assignmentCache[experimentName] == assignment {
-						assignmentCache.removeValue(forKey: experimentName)
-					}
-				}
-			}
-		}
+		_ = putLocked(lock: contextLock, dict: &overrides, key: experimentName, value: variant)
 	}
 
 	public func getOverride(experimentName: String) -> Int? {
@@ -192,19 +194,7 @@ public final class Context {
 	public func setCustomAssignment(experimentName: String, variant: Int) {
 		checkNotClosed()
 
-		let previous: Int? = putLocked(lock: contextLock, dict: &cassignments, key: experimentName, value: variant)
-		if previous == nil || previous != variant {
-			assignmentLock.lock()
-			defer { assignmentLock.unlock() }
-
-			if let assignment: Assignment = assignmentCache[experimentName] {
-				if !assignment.custom || assignment.variant != variant {
-					if assignmentCache[experimentName] == assignment {
-						assignmentCache.removeValue(forKey: experimentName)
-					}
-				}
-			}
-		}
+		_ = putLocked(lock: contextLock, dict: &cassignments, key: experimentName, value: variant)
 	}
 
 	public func getCustomAssignment(experimentName: String) -> Int? {
@@ -213,6 +203,30 @@ public final class Context {
 
 	public func setCustomAssignments(_ assignments: [String: Int]) {
 		assignments.forEach { setCustomAssignment(experimentName: $0.key, variant: $0.value) }
+	}
+
+	public func setUnit(unitType: String, uid: String) {
+		checkNotClosed()
+
+		let trimmed = uid.trimmingCharacters(in: .whitespacesAndNewlines)
+		precondition(!trimmed.isEmpty, "Unit '\(unitType)' UID must not be blank.")
+
+		contextLock.lock()
+		defer { contextLock.unlock() }
+
+		precondition(
+			{
+				if let previous = units[unitType], previous != uid {
+					return false
+				}
+				return true
+			}(), "Unit '\(unitType)' already set.")
+
+		units[unitType] = trimmed
+	}
+
+	public func setUnits(_ units: [String: String]) {
+		units.forEach { setUnit(unitType: $0, uid: $1) }
 	}
 
 	public func setAttribute(name: String, value: JSON) {
@@ -366,7 +380,7 @@ public final class Context {
 			}
 
 			closePromise = Promise<Void> { seal in
-				closing.store(true, ordering: .relaxed)
+				clearRefreshTimer()
 
 				if pendingCount.load(ordering: .relaxed) > 0 {
 					flush().done { [self] in
@@ -430,7 +444,7 @@ public final class Context {
 				if eventCount > 0 {
 					let event = PublishEvent(
 						true,
-						config.units.map {
+						units.map {
 							Unit(
 								type: $0.key, uid: String(bytes: getUnitHash($0.key, $0.value), encoding: .ascii) ?? "")
 						},
@@ -487,14 +501,32 @@ public final class Context {
 	}
 
 	private func getAssignment(_ experimentName: String) -> Assignment {
-		assignmentLock.lock()
-		defer { assignmentLock.unlock() }
-
-		if let assignment = assignmentCache[experimentName] {
-			return assignment
-		}
+		contextLock.lock()
+		defer { contextLock.unlock() }
 
 		let experiment: ExperimentVariables? = getExperiment(experimentName)
+
+		if let assignment = assignmentCache[experimentName] {
+			if let override = overrides[experimentName] {
+				if assignment.overridden && assignment.variant == override {
+					// override up-to-date
+					return assignment
+				}
+			} else if experiment == nil {
+				if !assignment.assigned {
+					// previously not-running experiment
+					return assignment
+				}
+			} else {
+				let custom = cassignments[experimentName]
+				if custom == nil || custom! == assignment.variant {
+					if experimentMatches(experiment!.data, assignment) {
+						// assignment up-to-date
+						return assignment
+					}
+				}
+			}
+		}
 
 		let assignment = Assignment()
 		assignment.name = experimentName
@@ -504,12 +536,6 @@ public final class Context {
 			if let experimentVariables = experiment {
 				assignment.id = experimentVariables.data.id
 				assignment.unitType = experimentVariables.data.unitType
-
-				if let unitType = experimentVariables.data.unitType, config.units[unitType] != nil {
-					assignment.assigned = true
-				} else {
-					assignment.assigned = false
-				}
 			}
 
 			assignment.overridden = true
@@ -534,7 +560,7 @@ public final class Context {
 				if experiment.data.audienceStrict && assignment.audienceMismatch {
 					assignment.variant = 0
 				} else if experiment.data.fullOnVariant == 0 {
-					if let unitType = experiment.data.unitType, let uid = config.units[unitType] {
+					if let unitType = experiment.data.unitType, let uid = units[unitType] {
 						let unitHash: [UInt8] = getUnitHash(unitType, uid)
 						let assigner = getVariantAssigner(unitType, unitHash)
 
@@ -594,8 +620,8 @@ public final class Context {
 	}
 
 	private func getUnitHash(_ unitType: String, _ unitUID: String) -> [UInt8] {
-		assignmentLock.lock()
-		defer { assignmentLock.unlock() }
+		contextLock.lock()
+		defer { contextLock.unlock() }
 
 		if let unitHash = hashedUnits[unitType] { return unitHash }
 
@@ -605,8 +631,8 @@ public final class Context {
 	}
 
 	private func getVariantAssigner(_ unitType: String, _ unitHash: [UInt8]) -> VariantAssigner {
-		assignmentLock.lock()
-		defer { assignmentLock.unlock() }
+		contextLock.lock()
+		defer { contextLock.unlock() }
 
 		if let variantAssigner = assigners[unitType] {
 			return variantAssigner
@@ -627,7 +653,7 @@ public final class Context {
 
 			if timeout == nil {
 				timeout = scheduler.schedule(
-					after: config.publishDelay,
+					after: publishDelay,
 					execute: { [self] in
 						_ = flush()
 					})
@@ -642,6 +668,23 @@ public final class Context {
 
 			timeout?.cancel()
 			timeout = nil
+		}
+	}
+
+	private func setRefreshTimer() {
+		if refreshInterval > 0 && refreshTimer == nil {
+			refreshTimer = scheduler.scheduleWithFixedDelay(
+				after: refreshInterval, repeating: refreshInterval,
+				execute: { [self] in
+					_ = refresh().done {}
+				})
+		}
+	}
+
+	private func clearRefreshTimer() {
+		if refreshTimer != nil {
+			refreshTimer!.cancel()
+			refreshTimer = nil
 		}
 	}
 
@@ -671,32 +714,15 @@ public final class Context {
 		}
 
 		dataLock.lock()
-		assignmentLock.lock()
 		defer {
-			assignmentLock.lock()
 			dataLock.unlock()
-		}
-
-		assignmentCache.forEach { experimentName, assignment in
-			if let experiment = index[experimentName] {
-				if !assignment.assigned {
-					// previously not running experiment was started
-					assignmentCache.removeValue(forKey: experimentName)
-				} else if !experimentMatches(experiment.data, assignment) {
-					// other relevant experiment data changed
-					assignmentCache.removeValue(forKey: experimentName)
-				}
-			} else {
-				if assignment.assigned {
-					// previously running experiment was stopped
-					assignmentCache.removeValue(forKey: experimentName)
-				}
-			}
 		}
 
 		self.data = data
 		self.index = index
 		self.indexVariables = indexVariables
+
+		setRefreshTimer()
 	}
 
 	private func setDataFailed(_ error: Error) {

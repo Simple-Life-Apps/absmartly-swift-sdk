@@ -84,9 +84,22 @@ Then we can initialize the A/B Smartly context directly with it.
 
 ```swift
 let contextConfig: ContextConfig = ContextConfig()
-contextConfig.setUnit(unitType: "device_id", uid: UIDevice.current.identifierForVendor!.uuidString))
+contextConfig.setUnit(unitType: "device_id", uid: UIDevice.current.identifierForVendor!.uuidString)
 
 let context = sdk.createContextWithData(config: anotherContextConfig, contextData: contextData)
+```
+
+#### Setting extra units for a context
+You can add additional units to a context by calling the `setUnit()` or the `setUnits()` method.
+This method may be used for example, when a user logs in to your application, and you want to use the new unit type to the context.
+Please note that **you cannot override an already set unit type** as that would be a change of identity, and will crash your application. In this case, you must create a new context instead.
+The `setUnit()` and `setUnits()` methods can be called before the context is ready.
+
+```swift
+context.setUnit(unitType: "db_user_id", uid: "1000013");
+context.setUnits([
+    "db_user_id": "1000013"
+]);
 ```
 
 #### Setting context attributes
@@ -136,12 +149,20 @@ context.close().done {
 #### Refreshing the context with fresh experiment data
 For long-running contexts, the context is usually created once when the application is first reached.
 However, any experiments being tracked in your production code, but started after the context was created, will not be triggered.
-To mitigate this, we can use the `refresh()` method. This method pulls updated experiment data from the A/B Smartly collector and will trigger recently started experiments when `getTreatment()` is called again.
+To mitigate this, we can use the `setRefreshInterval()` method on the context config.
+
+```swift
+let contextConfig: ContextConfig = ContextConfig()
+contextConfig.setUnit(unitType: "device_id", uid: UIDevice.current.identifierForVendor!.uuidString)
+contextConfig.refreshInterval = 4 * 3600; // every 4 hours
+```
+
+Alternatively, the `refresh()` method can be called manually.
 
 ```swift
 context.refresh().done {
     print("refreshed")
-})
+}
 ```
 
 

@@ -18,9 +18,8 @@ final class ContextTest: XCTestCase {
 		logger = ContextEventLoggerMock()
 		parser = DefaultVariableParser()
 		scheduler = SchedulerMock()
-		scheduler.scheduleAfterExecuteReturnValue = DefaultScheduledHandle(
-			handle: DispatchWorkItem {
-			})
+		scheduler.scheduleAfterExecuteReturnValue = ScheduledHandleMock()
+		scheduler.scheduleWithFixedDelayAfterRepeatingExecuteReturnValue = ScheduledHandleMock()
 		clock.millisReturnValue = 1_620_000_000_000
 	}
 
@@ -51,6 +50,12 @@ final class ContextTest: XCTestCase {
 		"show-modal": true,
 	]
 
+	let units = [
+		"email": "bleh@absmartly.com",
+		"session_id": "e791e240fcd3df7d238cfc285f475e8152fcc0ec",
+		"user_id": "123456789",
+	]
+
 	let publishUnits: [ABSmartly.Unit] = [
 		Unit(type: "email", uid: "IuqYkNRfEx5yClel4j3NbA"),
 		Unit(type: "session_id", uid: "pAE3a1i5Drs5mKRNq56adA"),
@@ -75,9 +80,7 @@ final class ContextTest: XCTestCase {
 		let contextConfig: ContextConfig = ContextConfig()
 
 		if withUnits {
-			contextConfig.setUnit(unitType: "session_id", uid: "e791e240fcd3df7d238cfc285f475e8152fcc0ec")
-			contextConfig.setUnit(unitType: "user_id", uid: "123456789")
-			contextConfig.setUnit(unitType: "email", uid: "bleh@absmartly.com")
+			contextConfig.setUnits(units: units)
 		}
 
 		return contextConfig
@@ -256,6 +259,57 @@ final class ContextTest: XCTestCase {
 		XCTAssertEqual(contextData.experiments.map { $0.name }, context.getExperiments())
 	}
 
+	func testStartsRefreshTimerWhenReady() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		contextConfig.refreshInterval = 5
+
+		let (promise, resolver) = Promise<ContextData>.pending()
+		let context = try createContext(config: contextConfig, data: promise)
+
+		provider.getContextDataReturnValue = Promise.value(try getContextData())
+
+		let expectation = XCTestExpectation()
+
+		_ = context.waitUntilReady().done { [self] _ in
+			XCTAssertEqual(1, scheduler.scheduleWithFixedDelayAfterRepeatingExecuteCallsCount)
+			XCTAssertEqual(
+				contextConfig.refreshInterval,
+				scheduler.scheduleWithFixedDelayAfterRepeatingExecuteReceivedArguments!.repeating)
+
+			XCTAssertEqual(0, provider.getContextDataCallsCount)
+
+			scheduler.scheduleWithFixedDelayAfterRepeatingExecuteReceivedArguments!.execute()
+
+			XCTAssertEqual(1, provider.getContextDataCallsCount)
+
+			expectation.fulfill()
+		}
+
+		resolver.fulfill(try getContextData())
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testDoesNotStartRefreshTimerWhenFailed() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		contextConfig.refreshInterval = 5
+
+		let (promise, resolver) = Promise<ContextData>.pending()
+		let context = try createContext(config: contextConfig, data: promise)
+
+		let expectation = XCTestExpectation()
+
+		_ = context.waitUntilReady().done { [self] _ in
+			XCTAssertEqual(0, scheduler.scheduleWithFixedDelayAfterRepeatingExecuteCallsCount)
+			XCTAssertEqual(0, provider.getContextDataCallsCount)
+			expectation.fulfill()
+		}
+
+		resolver.reject(ABSmartlyError("test"))
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
 	func testStartsPublishTimeoutWhenReadyWithQueueNotEmpty() throws {
 		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
 		let (promise, resolver) = Promise<ContextData>.pending()
@@ -274,6 +328,59 @@ final class ContextTest: XCTestCase {
 
 			expectation.fulfill()
 		}
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testSetUnit() {
+		let config = ContextConfig()
+		config.setUnit(unitType: "session_id", uid: "0ab1e23f4eee")
+
+		XCTAssertEqual(config.units["session_id"], "0ab1e23f4eee")
+	}
+
+	func testSetUnitsBeforeReady() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: false)
+		let (promise, resolver) = Promise<ContextData>.pending()
+		let context = try createContext(config: contextConfig, data: promise)
+		XCTAssertFalse(context.isReady())
+
+		let expectation = XCTestExpectation()
+
+		context.setUnits(units)
+
+		resolver.fulfill(try getContextData())
+
+		_ = context.waitUntilReady().done { [self] _ in
+			_ = context.getTreatment("exp_test_ab")
+
+			let (promise, resolver) = Promise<Void>.pending()
+			handler.publishEventReturnValue = promise
+
+			let expected = PublishEvent()
+			expected.hashed = true
+			expected.units = publishUnits
+			expected.publishedAt = clock.millis()
+			expected.exposures = [
+				Exposure(1, "exp_test_ab", "session_id", 1, clock.millis(), true, true, false, false, false, false)
+			]
+
+			_ = context.publish().done { [self] in
+				XCTAssertEqual(1, handler.publishEventCallsCount)
+
+				// sort so array equality works
+				handler.publishEventReceivedEvent?.units.sort(by: {
+					$0.type != $1.type ? $0.type < $1.type : $0.uid < $0.uid
+				})
+				XCTAssertEqual(expected, handler.publishEventReceivedEvent)
+
+				expectation.fulfill()
+			}
+
+			resolver.fulfill(())
+		}
+
+		resolver.fulfill(try getContextData())
 
 		wait(for: [expectation], timeout: 1.0)
 	}
@@ -819,10 +926,10 @@ final class ContextTest: XCTestCase {
 		expected.units = publishUnits
 		expected.publishedAt = clock.millis()
 		expected.exposures = [
-			Exposure(1, "exp_test_ab", "session_id", 12, clock.millis(), true, true, true, false, false, false),
-			Exposure(2, "exp_test_abc", "session_id", 13, clock.millis(), true, true, true, false, false, false),
-			Exposure(3, "exp_test_not_eligible", "user_id", 11, clock.millis(), true, true, true, false, false, false),
-			Exposure(4, "exp_test_fullon", "session_id", 13, clock.millis(), true, true, true, false, false, false),
+			Exposure(1, "exp_test_ab", "session_id", 12, clock.millis(), false, true, true, false, false, false),
+			Exposure(2, "exp_test_abc", "session_id", 13, clock.millis(), false, true, true, false, false, false),
+			Exposure(3, "exp_test_not_eligible", "user_id", 11, clock.millis(), false, true, true, false, false, false),
+			Exposure(4, "exp_test_fullon", "session_id", 13, clock.millis(), false, true, true, false, false, false),
 			Exposure(0, "not_found", nil, 3, clock.millis(), false, true, true, false, false, false),
 		]
 
@@ -1525,6 +1632,30 @@ final class ContextTest: XCTestCase {
 		wait(for: [expectation], timeout: 1.0)
 	}
 
+	func testCloseStopsRefreshTimer() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		contextConfig.refreshInterval = 5
+
+		let scheduledHandle = ScheduledHandleMock()
+		scheduler.scheduleWithFixedDelayAfterRepeatingExecuteReturnValue = scheduledHandle
+
+		let context = try createContext(config: contextConfig)
+		XCTAssertTrue(context.isReady())
+
+		let expectation = XCTestExpectation()
+
+		XCTAssertTrue(context.isReady())
+		XCTAssertTrue(scheduler.scheduleWithFixedDelayAfterRepeatingExecuteCalled)
+
+		_ = context.close().done {
+			XCTAssertEqual(1, scheduledHandle.cancelCallsCount)
+
+			expectation.fulfill()
+		}
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
 	func testRefresh() throws {
 		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
 		let contextData = try getContextData()
@@ -1655,6 +1786,62 @@ final class ContextTest: XCTestCase {
 		_ = context.getTreatment("not_found")
 
 		XCTAssertEqual(1 + UInt(contextData.experiments.count), context.getPendingCount())
+	}
+
+	func testRefreshKeepsAssignmentCacheWhenNotChangedOnAudienceMismatch() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData(source: "audience_strict_context")
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+		XCTAssertTrue(context.isReady())
+
+		XCTAssertEqual(0, context.getTreatment("exp_test_ab"))
+		XCTAssertEqual(1, context.getPendingCount())
+
+		let (promise, resolver) = Promise<ContextData>.pending()
+		provider.getContextDataReturnValue = promise
+
+		let expectation = XCTestExpectation()
+
+		_ = context.refresh().done { [self] in
+			XCTAssertEqual(1, provider.getContextDataCallsCount)
+			XCTAssertEqual(0, context.getTreatment("exp_test_ab"))
+			XCTAssertEqual(1, context.getPendingCount())
+
+			expectation.fulfill()
+		}
+
+		resolver.fulfill(contextData)
+
+		wait(for: [expectation], timeout: 1.0)
+	}
+
+	func testRefreshKeepsAssignmentCacheWhenNotChangedWithOverride() throws {
+		let contextConfig: ContextConfig = getContextConfig(withUnits: true)
+		let contextData = try getContextData()
+		let context = try createContext(config: contextConfig, data: Promise<ContextData>.value(contextData))
+		XCTAssertTrue(context.isReady())
+
+		context.setOverride(experimentName: "exp_test_ab", variant: 3)
+
+		XCTAssertEqual(3, context.getTreatment("exp_test_ab"))
+		XCTAssertEqual(1, context.getPendingCount())
+
+		let (promise, resolver) = Promise<ContextData>.pending()
+		provider.getContextDataReturnValue = promise
+
+		let expectation = XCTestExpectation()
+
+		_ = context.refresh().done { [self] in
+			XCTAssertEqual(1, provider.getContextDataCallsCount)
+			XCTAssertEqual(3, context.getTreatment("exp_test_ab"))
+			XCTAssertEqual(1, context.getPendingCount())
+
+			expectation.fulfill()
+		}
+
+		resolver.fulfill(contextData)
+
+		wait(for: [expectation], timeout: 1.0)
 	}
 
 	func testRefreshClearsAssignmentCacheForStoppedExperiment() throws {
